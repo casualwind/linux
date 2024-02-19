@@ -1630,20 +1630,17 @@ retry:
 	va->vm = NULL;
 	va->flags = va_flags;
 
-	spin_lock(&vmap_area_lock);
-	insert_vmap_area(va, &vmap_area_root, &vmap_area_list);
-	spin_unlock(&vmap_area_lock);
-
 	BUG_ON(!IS_ALIGNED(va->va_start, align));
 	BUG_ON(va->va_start < vstart);
 	BUG_ON(va->va_end > vend);
 
 	ret = kasan_populate_vmalloc(addr, size);
 	if (ret) {
-		free_vmap_area(va);
+		spin_lock(&free_vmap_area_lock);
+		merge_or_add_vmap_area_augment(va, &free_vmap_area_root, &free_vmap_area_list);
+		spin_unlock(&free_vmap_area_lock);
 		return ERR_PTR(ret);
 	}
-
 	return va;
 
 overflow:
@@ -1667,6 +1664,13 @@ overflow:
 
 	kmem_cache_free(vmap_area_cachep, va);
 	return ERR_PTR(-EBUSY);
+}
+
+static inline void insert_vmap_area_locked(struct vmap_area *va)
+{
+	spin_lock(&vmap_area_lock);
+	insert_vmap_area(va, &vmap_area_root, &vmap_area_list);
+	spin_unlock(&vmap_area_lock);
 }
 
 int register_vmap_purge_notifier(struct notifier_block *nb)
@@ -2045,6 +2049,8 @@ static void *new_vmap_block(unsigned int order, gfp_t gfp_mask)
 		return ERR_CAST(va);
 	}
 
+	insert_vmap_area_locked(va);
+
 	vaddr = vmap_block_vaddr(va->va_start, 0);
 	spin_lock_init(&vb->lock);
 	vb->va = va;
@@ -2398,6 +2404,8 @@ void *vm_map_ram(struct page **pages, unsigned int count, int node)
 		if (IS_ERR(va))
 			return NULL;
 
+		insert_vmap_area_locked(va);
+
 		addr = va->va_start;
 		mem = (void *)addr;
 	}
@@ -2538,7 +2546,7 @@ static void vmap_init_free_space(void)
 	}
 }
 
-static inline void setup_vmalloc_vm_locked(struct vm_struct *vm,
+static inline void setup_vmalloc_vm(struct vm_struct *vm,
 	struct vmap_area *va, unsigned long flags, const void *caller)
 {
 	vm->flags = flags;
@@ -2546,14 +2554,6 @@ static inline void setup_vmalloc_vm_locked(struct vm_struct *vm,
 	vm->size = va->va_end - va->va_start;
 	vm->caller = caller;
 	va->vm = vm;
-}
-
-static void setup_vmalloc_vm(struct vm_struct *vm, struct vmap_area *va,
-			      unsigned long flags, const void *caller)
-{
-	spin_lock(&vmap_area_lock);
-	setup_vmalloc_vm_locked(vm, va, flags, caller);
-	spin_unlock(&vmap_area_lock);
 }
 
 static void clear_vm_uninitialized_flag(struct vm_struct *vm)
@@ -2599,6 +2599,8 @@ static struct vm_struct *__get_vm_area_node(unsigned long size,
 	}
 
 	setup_vmalloc_vm(area, va, flags, caller);
+
+	insert_vmap_area_locked(va);
 
 	/*
 	 * Mark pages for non-VM_ALLOC mappings as accessible. Do it now as a
@@ -4166,7 +4168,7 @@ retry:
 	for (area = 0; area < nr_vms; area++) {
 		insert_vmap_area(vas[area], &vmap_area_root, &vmap_area_list);
 
-		setup_vmalloc_vm_locked(vms[area], vas[area], VM_ALLOC,
+		setup_vmalloc_vm(vms[area], vas[area], VM_ALLOC,
 				 pcpu_get_vm_areas);
 	}
 	spin_unlock(&vmap_area_lock);
